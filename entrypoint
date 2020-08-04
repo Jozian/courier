@@ -1,0 +1,11 @@
+#!/bin/sh
+
+CMD="${@}"
+
+set -e
+
+if [ "${CMD%${CMD#fuzzer}}" = "fuzzer" ]; then
+    exec ${CMD}
+fi
+
+exec courier "${@}"
