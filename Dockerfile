@@ -18,4 +18,4 @@ COPY --from=builder /root/courier/fuzzer /usr/bin/
 COPY entrypoint /usr/bin/
 EXPOSE 8080
 USER courier
-ENTRYPOINT ["/usr/bin/entrypoint"]
+ENTRYPOINT ["entrypoint"]
