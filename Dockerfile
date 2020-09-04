@@ -11,6 +11,8 @@ RUN adduser --uid 1000 --disabled-password --gecos '' --home /srv/courier courie
 RUN apt-get -yq update \
         && DEBIAN_FRONTEND=noninteractive apt-get install -y \
                 unattended-upgrades \
+                # ssl certs to external services
+                ca-certificates \
         && rm -rf /var/lib/apt/lists/* \
         && apt-get clean
 COPY --from=builder /root/courier/courier /usr/bin/
