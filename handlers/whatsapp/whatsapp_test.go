@@ -123,7 +123,8 @@ var documentMsg = `{
 			"link": "https://example.org/v1/media/41",
 			"mime_type": "text/plain",
 			"sha256": "the-sha-signature",
-			"caption": "the caption"
+			"caption": "the caption",
+			"filename": "filename.type"
 		}
 	}]
 }`
@@ -389,7 +390,7 @@ var defaultSendTestCases = []ChannelSendTestCase{
 			MockedRequest{
 				Method: "POST",
 				Path:   "/v1/messages",
-				Body:   `{"to":"250788123123","type":"document","document":{"link":"https://foo.bar/document.pdf","caption":"document caption"}}`,
+				Body:   `{"to":"250788123123","type":"document","document":{"link":"https://foo.bar/document.pdf","caption":"document caption","filename":"document.pdf"}}`,
 			}: MockedResponse{
 				Status: 201,
 				Body:   `{ "messages": [{"id": "157b5e14568e8"}] }`,
@@ -447,6 +448,15 @@ var defaultSendTestCases = []ChannelSendTestCase{
 		Metadata:     json.RawMessage(`{ "templating": { "template": { "name": "revive_issue", "uuid": "171f8a4d-f725-46d7-85a6-11aceff0bfe3" }, "language": "eng", "country": "US", "variables": ["Chef", "tomorrow"]}}`),
 		ResponseBody: `{ "messages": [{"id": "157b5e14568e8"}] }`, ResponseStatus: 200,
 		RequestBody: `{"to":"250788123123","type":"template","template":{"namespace":"waba_namespace","name":"revive_issue","language":{"policy":"deterministic","code":"en_US"},"components":[{"type":"body","parameters":[{"type":"text","text":"Chef"},{"type":"text","text":"tomorrow"}]}]}}`,
+		SendPrep:    setSendURL,
+	},
+	{Label: "Template Namespace",
+		Text:   "templated message",
+		URN:    "whatsapp:250788123123",
+		Status: "W", ExternalID: "157b5e14568e8",
+		Metadata:     json.RawMessage(`{ "templating": { "template": { "name": "revive_issue", "uuid": "171f8a4d-f725-46d7-85a6-11aceff0bfe3" }, "namespace": "wa_template_namespace", "language": "eng", "country": "US", "variables": ["Chef", "tomorrow"]}}`),
+		ResponseBody: `{ "messages": [{"id": "157b5e14568e8"}] }`, ResponseStatus: 200,
+		RequestBody: `{"to":"250788123123","type":"template","template":{"namespace":"wa_template_namespace","name":"revive_issue","language":{"policy":"deterministic","code":"en_US"},"components":[{"type":"body","parameters":[{"type":"text","text":"Chef"},{"type":"text","text":"tomorrow"}]}]}}`,
 		SendPrep:    setSendURL,
 	},
 	{Label: "Template Invalid Language",
