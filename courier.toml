@@ -39,3 +39,5 @@ s3_media_prefix = "media"
 
 # the DSN token for reporting errors to sentry
 sentry_dsn = ""
+
+save_attachments = true

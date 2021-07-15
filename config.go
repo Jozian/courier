@@ -28,6 +28,7 @@ type Config struct {
 	StatusUsername            string `help:"the username that is needed to authenticate against the /status endpoint"`
 	StatusPassword            string `help:"the password that is needed to authenticate against the /status endpoint"`
 	LogLevel                  string `help:"the logging level courier should use"`
+	SaveAttachments           bool   `help:"whether we save attachments at all, or just pass their URLs"`
 	Version                   string `help:"the version that will be used in request and response headers"`
 
 	// IncludeChannels is the list of channels to enable, empty means include all
@@ -59,6 +60,7 @@ func NewConfig() *Config {
 		FacebookWebhookSecret:     "missing_facebook_webhook_secret",
 		MaxWorkers:                32,
 		LogLevel:                  "error",
+		SaveAttachments:           true,
 		Version:                   "Dev",
 	}
 }

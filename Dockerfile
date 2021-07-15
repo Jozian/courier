@@ -2,6 +2,9 @@ FROM golang:1.16-buster AS builder
 ENV CGO_ENABLED=0
 ARG COMPILE_FLAGS
 WORKDIR /root/courier
+COPY go.mod /root/courier/go.mod
+COPY go.sum /root/courier/go.sum
+RUN go mod download
 COPY . /root/courier
 RUN go build -ldflags "${COMPILE_FLAGS}" -o courier ./cmd/courier \
             && go build -ldflags "${COMPILE_FLAGS}" -o fuzzer ./cmd/fuzzer
@@ -20,4 +23,5 @@ COPY --from=builder /root/courier/fuzzer /usr/bin/
 COPY entrypoint /usr/bin/
 EXPOSE 8080
 USER courier
+WORKDIR /srv/courier
 ENTRYPOINT ["entrypoint"]

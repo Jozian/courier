@@ -58,16 +58,17 @@ func writeMsg(ctx context.Context, b *backend, msg courier.Msg) error {
 		return nil
 	}
 
-	channel := m.Channel()
-
-	// if we have media, go download it to S3
-	for i, attachment := range m.Attachments_ {
-		if strings.HasPrefix(attachment, "http") {
-			url, err := downloadMediaToS3(ctx, b, channel, m.OrgID_, m.UUID_, attachment)
-			if err != nil {
-				return err
+	if b.config.SaveAttachments {
+		// if we have media, go download it to S3
+		channel := m.Channel()
+		for i, attachment := range m.Attachments_ {
+			if strings.HasPrefix(attachment, "http") {
+				url, err := downloadMediaToS3(ctx, b, channel, m.OrgID_, m.UUID_, attachment)
+				if err != nil {
+					return err
+				}
+				m.Attachments_[i] = url
 			}
-			m.Attachments_[i] = url
 		}
 	}
 
