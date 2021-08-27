@@ -69,11 +69,15 @@ func getFormField(form url.Values, name string) string {
 	return ""
 }
 
+type discordMetaData struct {
+	FromDisplayName string `json:"from_displayname"`
+}
+
 // receiveMessage is our HTTP handler function for incoming messages
 func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w http.ResponseWriter, r *http.Request) ([]courier.Event, error) {
 	var err error
 
-	var from, text string
+	var from, text, fromDisplayName string
 
 	// parse our form
 	err = r.ParseForm()
@@ -83,6 +87,7 @@ func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w
 
 	from = getFormField(r.Form, "from")
 	text = getFormField(r.Form, "text")
+	fromDisplayName = getFormField(r.Form, "from_displayname")
 
 	// must have from field
 	if from == "" {
@@ -107,6 +112,12 @@ func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w
 
 	for _, attachment := range r.Form["attachments"] {
 		msg.WithAttachment(attachment)
+	}
+
+	meta := &discordMetaData{FromDisplayName: fromDisplayName}
+	rawMeta, err := json.Marshal(meta)
+	if err == nil {
+		msg.WithMetadata(rawMeta)
 	}
 
 	// and finally write our message
