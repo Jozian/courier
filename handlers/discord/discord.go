@@ -77,7 +77,7 @@ type discordMetaData struct {
 func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w http.ResponseWriter, r *http.Request) ([]courier.Event, error) {
 	var err error
 
-	var from, text, fromDisplayName string
+	var from, text, extID string
 
 	// parse our form
 	err = r.ParseForm()
@@ -87,7 +87,7 @@ func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w
 
 	from = getFormField(r.Form, "from")
 	text = getFormField(r.Form, "text")
-	fromDisplayName = getFormField(r.Form, "from_displayname")
+	extID = getFormField(r.Form, "ext_id")
 
 	// must have from field
 	if from == "" {
@@ -114,11 +114,7 @@ func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w
 		msg.WithAttachment(attachment)
 	}
 
-	meta := &discordMetaData{FromDisplayName: fromDisplayName}
-	rawMeta, err := json.Marshal(meta)
-	if err == nil {
-		msg.WithMetadata(rawMeta)
-	}
+	msg.WithExternalID(extID)
 
 	// and finally write our message
 	return handlers.WriteMsgsAndResponse(ctx, h, []courier.Msg{msg}, w, r)
