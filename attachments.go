@@ -20,6 +20,8 @@ const (
 	maxAttBodyReadBytes = 100 * 1024 * 1024
 )
 
+var ShouldNotSaveAttachmentsError = errors.New("This backend is configured not to send attachments")
+
 type Attachment struct {
 	ContentType string `json:"content_type"`
 	URL         string `json:"url"`
@@ -136,13 +138,14 @@ func FetchAndStoreAttachment(ctx context.Context, b Backend, channel Channel, at
 		}
 	}
 
-	if b.config.SaveAttachments {
 	storageURL, err := b.SaveAttachment(ctx, channel, mimeType, trace.ResponseBody, extension)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, ShouldNotSaveAttachmentsError) {
+			storageURL = parsedURL.String()
+		} else {
+			return nil, err
+		}
 	}
-	} else
-	storageURL := parsedURL
-	return &Attachment{ContentType: mimeType, URL: storageURL, Size: len(trace.ResponseBody)}, nil
 
+	return &Attachment{ContentType: mimeType, URL: storageURL, Size: len(trace.ResponseBody)}, nil
 }

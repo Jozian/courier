@@ -409,6 +409,9 @@ func (b *backend) WriteExternalIDSeen(msg courier.Msg) {
 
 // SaveAttachment saves an attachment to backend storage
 func (b *backend) SaveAttachment(ctx context.Context, ch courier.Channel, contentType string, data []byte, extension string) (string, error) {
+	if !b.config.SaveAttachments {
+		return "", courier.ShouldNotSaveAttachmentsError
+	}
 	// create our filename
 	filename := string(uuids.New())
 	if extension != "" {
