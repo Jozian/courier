@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/nyaruka/librato"
+	"github.com/nyaruka/gocommon/analytics"
 	"github.com/sirupsen/logrus"
 )
 
@@ -65,7 +65,7 @@ func (f *Foreman) Assign() {
 	backend := f.server.Backend()
 	lastSleep := false
 
-	for true {
+	for {
 		select {
 		// return if we have been told to stop
 		case <-f.quit:
@@ -106,7 +106,6 @@ type Sender struct {
 	id      int
 	foreman *Foreman
 	job     chan Msg
-	log     *logrus.Entry
 }
 
 // NewSender creates a new sender responsible for sending messages
@@ -121,14 +120,15 @@ func NewSender(foreman *Foreman, id int) *Sender {
 
 // Start starts our Sender's goroutine and has it start waiting for tasks from the foreman
 func (w *Sender) Start() {
+	w.foreman.server.WaitGroup().Add(1)
+
 	go func() {
-		w.foreman.server.WaitGroup().Add(1)
 		defer w.foreman.server.WaitGroup().Done()
 
 		log := logrus.WithField("comp", "sender").WithField("sender_id", w.id)
 		log.Debug("started")
 
-		for true {
+		for {
 			// list ourselves as available for work
 			w.foreman.availableSenders <- w
 
@@ -154,7 +154,6 @@ func (w *Sender) Stop() {
 func (w *Sender) sendMessage(msg Msg) {
 	log := logrus.WithField("comp", "sender").WithField("sender_id", w.id).WithField("channel_uuid", msg.Channel().UUID())
 
-	var status MsgStatus
 	server := w.foreman.server
 	backend := server.Backend()
 
@@ -178,7 +177,6 @@ func (w *Sender) sendMessage(msg Msg) {
 		if err != nil {
 			log.WithError(err).Error("error clearing sent status for msg")
 		}
-
 	}
 
 	// was this msg already sent? (from a double queue?)
@@ -189,44 +187,48 @@ func (w *Sender) sendMessage(msg Msg) {
 		log.WithError(err).Error("error looking up msg was sent")
 	}
 
-	// is this msg in a loop?
-	loop, err := backend.IsMsgLoop(sendCTX, msg)
-
-	// failing on loop lookup isn't permanent, but log
-	if err != nil {
-		log.WithError(err).Error("error looking up msg loop")
+	var status MsgStatus
+	var redactValues []string
+	handler := server.GetHandler(msg.Channel())
+	if handler != nil {
+		redactValues = handler.RedactValues(msg.Channel())
 	}
 
-	if sent {
-		// if this message was already sent, create a wired status for it
-		status = backend.NewMsgStatusForID(msg.Channel(), msg.ID(), MsgWired)
+	clog := NewChannelLogForSend(msg, redactValues)
+
+	if handler == nil {
+		// if there's no handler, create a FAILED status for it
+		status = backend.NewMsgStatusForID(msg.Channel(), msg.ID(), MsgFailed, clog)
+		log.Errorf("unable to find handler for channel type: %s", msg.Channel().ChannelType())
+
+	} else if sent {
+		// if this message was already sent, create a WIRED status for it
+		status = backend.NewMsgStatusForID(msg.Channel(), msg.ID(), MsgWired, clog)
 		log.Warning("duplicate send, marking as wired")
-	} else if loop {
-		// if this contact is in a loop, fail the message immediately without sending
-		status = backend.NewMsgStatusForID(msg.Channel(), msg.ID(), MsgFailed)
-		status.AddLog(NewChannelLogFromError("Message Loop", msg.Channel(), msg.ID(), 0, fmt.Errorf("message loop detected, failing message without send")))
-		log.Error("message loop detected, failing message")
+
 	} else {
 		// send our message
-		status, err = server.SendMsg(sendCTX, msg)
-		duration := time.Now().Sub(start)
+		status, err = handler.Send(sendCTX, msg, clog)
+		duration := time.Since(start)
 		secondDuration := float64(duration) / float64(time.Second)
 
 		if err != nil {
 			log.WithError(err).WithField("elapsed", duration).Error("error sending message")
+			clog.RawError(err)
+
+			// possible for handlers to only return an error in which case we construct an error status
 			if status == nil {
-				status = backend.NewMsgStatusForID(msg.Channel(), msg.ID(), MsgErrored)
-				status.AddLog(NewChannelLogFromError("Sending Error", msg.Channel(), msg.ID(), duration, err))
+				status = backend.NewMsgStatusForID(msg.Channel(), msg.ID(), MsgErrored, clog)
 			}
 		}
 
 		// report to librato and log locally
 		if status.Status() == MsgErrored || status.Status() == MsgFailed {
 			log.WithField("elapsed", duration).Warning("msg errored")
-			librato.Gauge(fmt.Sprintf("courier.msg_send_error_%s", msg.Channel().ChannelType()), secondDuration)
+			analytics.Gauge(fmt.Sprintf("courier.msg_send_error_%s", msg.Channel().ChannelType()), secondDuration)
 		} else {
 			log.WithField("elapsed", duration).Info("msg sent")
-			librato.Gauge(fmt.Sprintf("courier.msg_send_%s", msg.Channel().ChannelType()), secondDuration)
+			analytics.Gauge(fmt.Sprintf("courier.msg_send_%s", msg.Channel().ChannelType()), secondDuration)
 		}
 	}
 
@@ -239,8 +241,10 @@ func (w *Sender) sendMessage(msg Msg) {
 		log.WithError(err).Info("error writing msg status")
 	}
 
+	clog.End()
+
 	// write our logs as well
-	err = backend.WriteChannelLogs(writeCTX, status.Logs())
+	err = backend.WriteChannelLog(writeCTX, clog)
 	if err != nil {
 		log.WithError(err).Info("error writing msg logs")
 	}

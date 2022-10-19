@@ -2,115 +2,195 @@ package courier
 
 import (
 	"fmt"
-	"net/http"
 	"strings"
 	"time"
 
-	"github.com/nyaruka/courier/utils"
+	"github.com/nyaruka/gocommon/dates"
+	"github.com/nyaruka/gocommon/httpx"
+	"github.com/nyaruka/gocommon/stringsx"
+	"github.com/nyaruka/gocommon/uuids"
 )
 
-// NilStatusCode is used when we have an error before even sending anything
-const NilStatusCode int = 417
+// ChannelLogUUID is our type for a channel log UUID
+type ChannelLogUUID uuids.UUID
 
-// NewChannelLog creates a new channel log for the passed in channel, id, and request and response info
-func NewChannelLog(description string, channel Channel, msgID MsgID, method string, url string, statusCode int,
-	request string, response string, elapsed time.Duration, err error) *ChannelLog {
+// ChannelLogType is the type of channel interaction we are logging
+type ChannelLogType string
 
-	errString := ""
-	if err != nil {
-		errString = err.Error()
-	}
+const (
+	ChannelLogTypeUnknown         ChannelLogType = "unknown"
+	ChannelLogTypeMsgSend         ChannelLogType = "msg_send"
+	ChannelLogTypeMsgStatus       ChannelLogType = "msg_status"
+	ChannelLogTypeMsgReceive      ChannelLogType = "msg_receive"
+	ChannelLogTypeEventReceive    ChannelLogType = "event_receive"
+	ChannelLogTypeAttachmentFetch ChannelLogType = "attachment_fetch"
+	ChannelLogTypeTokenRefresh    ChannelLogType = "token_refresh"
+	ChannelLogTypePageSubscribe   ChannelLogType = "page_subscribe"
+)
 
-	return &ChannelLog{
-		Description: description,
-		Channel:     channel,
-		MsgID:       msgID,
-		Method:      method,
-		URL:         url,
-		StatusCode:  statusCode,
-		Error:       errString,
-		Request:     sanitizeBody(request),
-		Response:    sanitizeBody(response),
-		CreatedOn:   time.Now(),
-		Elapsed:     elapsed,
-	}
+type ChannelError struct {
+	message string
+	code    string
 }
 
-func sanitizeBody(body string) string {
-	parts := strings.SplitN(body, "\r\n\r\n", 2)
-	if len(parts) < 2 {
-		return body
-	}
-
-	ct := http.DetectContentType([]byte(parts[1]))
-
-	// if this isn't text, replace with placeholder
-	if !strings.HasPrefix(ct, "text") {
-		return fmt.Sprintf("%s\r\n\r\nOmitting non text body of type: %s", parts[0], ct)
-	}
-
-	return body
+func NewChannelError(message, code string) *ChannelError {
+	return &ChannelError{message: message, code: code}
 }
 
-// NewChannelLogFromRR creates a new channel log for the passed in channel, id, and request/response log
-func NewChannelLogFromRR(description string, channel Channel, msgID MsgID, rr *utils.RequestResponse) *ChannelLog {
-	log := &ChannelLog{
-		Description: description,
-		Channel:     channel,
-		MsgID:       msgID,
-		Method:      rr.Method,
-		URL:         rr.URL,
-		StatusCode:  rr.StatusCode,
-		Request:     sanitizeBody(rr.Request),
-		Response:    sanitizeBody(rr.Response),
-		CreatedOn:   time.Now(),
-		Elapsed:     rr.Elapsed,
+func ErrorResponseStatusCode() *ChannelError {
+	return NewChannelError("Unexpected response status code.", "core:response_status_code")
+}
+
+func ErrorResponseUnparseable(format string) *ChannelError {
+	return NewChannelError(fmt.Sprintf("Unable to parse response as %s.", format), "core:response_unparseable")
+}
+
+func ErrorResponseValueMissing(key string) *ChannelError {
+	return NewChannelError(fmt.Sprintf("Unable to find '%s' response.", key), "core:response_value_missing")
+}
+
+func ErrorResponseValueUnexpected(key string, expected ...string) *ChannelError {
+	es := make([]string, len(expected))
+	for i := range expected {
+		es[i] = fmt.Sprintf("'%s'", expected[i])
 	}
-
-	return log
+	return NewChannelError(fmt.Sprintf("Expected '%s' in response to be %s.", key, strings.Join(es, " or ")), "core:response_value_unexpected")
 }
 
-// NewChannelLogFromError creates a new channel log for the passed in channel, msg id and error
-func NewChannelLogFromError(description string, channel Channel, msgID MsgID, elapsed time.Duration, err error) *ChannelLog {
-	log := &ChannelLog{
-		Description: description,
-		Channel:     channel,
-		MsgID:       msgID,
-		Error:       err.Error(),
-		CreatedOn:   time.Now(),
-		Elapsed:     elapsed,
+func ErrorUnsupportedMedia(contentType string) *ChannelError {
+	return NewChannelError(fmt.Sprintf("Unsupported attachment media type: %s.", contentType), "core:media_unsupported_type")
+}
+
+func ErrorServiceSpecific(ns, code, message string) *ChannelError {
+	if message == "" {
+		message = fmt.Sprintf("Service specific error: %s.", code)
 	}
-
-	return log
+	return NewChannelError(message, fmt.Sprintf("%s:%s", ns, code))
 }
 
-// WithError augments the passed in ChannelLog with the passed in description and error if error is not nil
-func (l *ChannelLog) WithError(description string, err error) *ChannelLog {
-	if err != nil {
-		l.Error = err.Error()
-		l.Description = description
-	}
-
-	return l
+func (e *ChannelError) Redact(r stringsx.Redactor) *ChannelError {
+	return &ChannelError{message: r(e.message), code: r(e.code)}
 }
 
-func (l *ChannelLog) String() string {
-	return fmt.Sprintf("%s: %d %s %d\n%s\n%s\n%s", l.Description, l.StatusCode, l.URL, l.Elapsed, l.Error, l.Request, l.Response)
+func (e *ChannelError) Message() string {
+	return e.message
 }
 
-// ChannelLog represents the log for a msg being received, sent or having its status updated. It includes the HTTP request
-// and response for the action as well as the channel it was performed on and an option ID of the msg (for some error
-// cases we may log without a msg id)
+func (e *ChannelError) Code() string {
+	return e.code
+}
+
+// ChannelLog stores the HTTP traces and errors generated by an interaction with a channel.
 type ChannelLog struct {
-	Description string
-	Channel     Channel
-	MsgID       MsgID
-	Method      string
-	URL         string
-	StatusCode  int
-	Error       string
-	Request     string
-	Response    string
-	Elapsed     time.Duration
-	CreatedOn   time.Time
+	uuid      ChannelLogUUID
+	type_     ChannelLogType
+	channel   Channel
+	msgID     MsgID
+	httpLogs  []*httpx.Log
+	errors    []*ChannelError
+	createdOn time.Time
+	elapsed   time.Duration
+
+	recorder *httpx.Recorder
+	redactor stringsx.Redactor
+}
+
+// NewChannelLogForIncoming creates a new channel log for an incoming request, the type of which won't be known
+// until the handler completes.
+func NewChannelLogForIncoming(ch Channel, r *httpx.Recorder, redactVals []string) *ChannelLog {
+	return newChannelLog(ChannelLogTypeUnknown, ch, r, NilMsgID, redactVals)
+}
+
+// NewChannelLogForSend creates a new channel log for a message send
+func NewChannelLogForSend(msg Msg, redactVals []string) *ChannelLog {
+	return newChannelLog(ChannelLogTypeMsgSend, msg.Channel(), nil, msg.ID(), redactVals)
+}
+
+// NewChannelLogForSend creates a new channel log for an attachment fetch
+func NewChannelLogForAttachmentFetch(ch Channel, redactVals []string) *ChannelLog {
+	return newChannelLog(ChannelLogTypeAttachmentFetch, ch, nil, NilMsgID, redactVals)
+}
+
+// NewChannelLog creates a new channel log with the given type and channel
+func NewChannelLog(t ChannelLogType, ch Channel, redactVals []string) *ChannelLog {
+	return newChannelLog(t, ch, nil, NilMsgID, redactVals)
+}
+
+func newChannelLog(t ChannelLogType, ch Channel, r *httpx.Recorder, mid MsgID, redactVals []string) *ChannelLog {
+	return &ChannelLog{
+		uuid:      ChannelLogUUID(uuids.New()),
+		type_:     t,
+		channel:   ch,
+		recorder:  r,
+		msgID:     mid,
+		createdOn: dates.Now(),
+
+		redactor: stringsx.NewRedactor("**********", redactVals...),
+	}
+}
+
+// HTTP logs an outgoing HTTP request and response
+func (l *ChannelLog) HTTP(t *httpx.Trace) {
+	l.httpLogs = append(l.httpLogs, l.traceToLog(t))
+}
+
+func (l *ChannelLog) Error(e *ChannelError) {
+	l.errors = append(l.errors, e.Redact(l.redactor))
+}
+
+func (l *ChannelLog) RawError(err error) {
+	l.Error(NewChannelError(err.Error(), ""))
+}
+
+func (l *ChannelLog) End() {
+	if l.recorder != nil {
+		// prepend so it's the first HTTP request in the log
+		l.httpLogs = append([]*httpx.Log{l.traceToLog(l.recorder.Trace)}, l.httpLogs...)
+	}
+
+	l.elapsed = time.Since(l.createdOn)
+}
+
+func (l *ChannelLog) UUID() ChannelLogUUID {
+	return l.uuid
+}
+
+func (l *ChannelLog) Type() ChannelLogType {
+	return l.type_
+}
+
+func (l *ChannelLog) SetType(t ChannelLogType) {
+	l.type_ = t
+}
+
+func (l *ChannelLog) Channel() Channel {
+	return l.channel
+}
+
+func (l *ChannelLog) MsgID() MsgID {
+	return l.msgID
+}
+
+func (l *ChannelLog) SetMsgID(id MsgID) {
+	l.msgID = id
+}
+
+func (l *ChannelLog) HTTPLogs() []*httpx.Log {
+	return l.httpLogs
+}
+
+func (l *ChannelLog) Errors() []*ChannelError {
+	return l.errors
+}
+
+func (l *ChannelLog) CreatedOn() time.Time {
+	return l.createdOn
+}
+
+func (l *ChannelLog) Elapsed() time.Duration {
+	return l.elapsed
+}
+
+func (l *ChannelLog) traceToLog(t *httpx.Trace) *httpx.Log {
+	return httpx.NewLog(t, 2048, 50000, l.redactor)
 }

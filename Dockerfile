@@ -1,4 +1,4 @@
-FROM golang:1.16-buster AS builder
+FROM golang:1.18-buster AS builder
 ENV CGO_ENABLED=0
 ARG COMPILE_FLAGS
 WORKDIR /root/courier
@@ -23,5 +23,4 @@ COPY --from=builder /root/courier/fuzzer /usr/bin/
 COPY entrypoint /usr/bin/
 EXPOSE 8080
 USER courier
-WORKDIR /srv/courier
 ENTRYPOINT ["entrypoint"]

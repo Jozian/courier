@@ -2,29 +2,22 @@ package rapidpro
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
-	"net/http"
-	"net/url"
 	"os"
-	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/buger/jsonparser"
-
-	"mime"
-
 	"github.com/gomodule/redigo/redis"
 	"github.com/lib/pq"
 	"github.com/nyaruka/courier"
 	"github.com/nyaruka/courier/queue"
-	"github.com/nyaruka/courier/utils"
 	"github.com/nyaruka/gocommon/urns"
 	"github.com/nyaruka/null"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	filetype "gopkg.in/h2non/filetype.v1"
 )
@@ -50,7 +43,7 @@ const (
 )
 
 // WriteMsg creates a message given the passed in arguments
-func writeMsg(ctx context.Context, b *backend, msg courier.Msg) error {
+func writeMsg(ctx context.Context, b *backend, msg courier.Msg, clog *courier.ChannelLog) error {
 	m := msg.(*DBMsg)
 
 	// this msg has already been written (we received it twice), we are a no op
@@ -58,22 +51,38 @@ func writeMsg(ctx context.Context, b *backend, msg courier.Msg) error {
 		return nil
 	}
 
-	if b.config.SaveAttachments {
-		// if we have media, go download it to S3
-		channel := m.Channel()
-		for i, attachment := range m.Attachments_ {
-			if strings.HasPrefix(attachment, "http") {
-				url, err := downloadMediaToS3(ctx, b, channel, m.OrgID_, m.UUID_, attachment)
-				if err != nil {
-					return err
-				}
-				m.Attachments_[i] = url
+	channel := m.Channel()
+
+	// check for data: attachment URLs which need to be fetched now - fetching of other URLs can be deferred until
+	// message handling and performed by calling the /c/_fetch-attachment endpoint
+	for i, attURL := range m.Attachments_ {
+		if strings.HasPrefix(attURL, "data:") {
+			attData, err := base64.StdEncoding.DecodeString(attURL[5:])
+			if err != nil {
+				clog.Error(courier.NewChannelError("Unable to decode attachment data.", ""))
+				return errors.Wrap(err, "unable to decode attachment data")
 			}
+
+			var contentType, extension string
+			fileType, _ := filetype.Match(attData[:300])
+			if fileType != filetype.Unknown {
+				contentType = fileType.MIME.Value
+				extension = fileType.Extension
+			} else {
+				contentType = "application/octet-stream"
+				extension = "bin"
+			}
+
+			newURL, err := b.SaveAttachment(ctx, channel, contentType, attData, extension)
+			if err != nil {
+				return err
+			}
+			m.Attachments_[i] = fmt.Sprintf("%s:%s", contentType, newURL)
 		}
 	}
 
 	// try to write it our db
-	err := writeMsgToDB(ctx, b, m)
+	err := writeMsgToDB(ctx, b, m, clog)
 
 	// fail? log
 	if err != nil {
@@ -90,7 +99,7 @@ func writeMsg(ctx context.Context, b *backend, msg courier.Msg) error {
 }
 
 // newMsg creates a new DBMsg object with the passed in parameters
-func newMsg(direction MsgDirection, channel courier.Channel, urn urns.URN, text string) *DBMsg {
+func newMsg(direction MsgDirection, channel courier.Channel, urn urns.URN, text string, clog *courier.ChannelLog) *DBMsg {
 	now := time.Now()
 	dbChannel := channel.(*DBChannel)
 
@@ -113,6 +122,7 @@ func newMsg(direction MsgDirection, channel courier.Channel, urn urns.URN, text 
 		CreatedOn_:   now,
 		ModifiedOn_:  now,
 		QueuedOn_:    now,
+		LogUUIDs:     []string{string(clog.UUID())},
 
 		channel:        dbChannel,
 		workerToken:    "",
@@ -120,38 +130,37 @@ func newMsg(direction MsgDirection, channel courier.Channel, urn urns.URN, text 
 	}
 }
 
-const insertMsgSQL = `
+const sqlInsertMsg = `
 INSERT INTO
 	msgs_msg(org_id, uuid, direction, text, attachments, msg_count, error_count, high_priority, status,
-             visibility, external_id, channel_id, contact_id, contact_urn_id, created_on, modified_on, next_attempt, queued_on, sent_on)
+             visibility, external_id, channel_id, contact_id, contact_urn_id, created_on, modified_on, next_attempt, queued_on, sent_on, log_uuids)
     VALUES(:org_id, :uuid, :direction, :text, :attachments, :msg_count, :error_count, :high_priority, :status,
-           :visibility, :external_id, :channel_id, :contact_id, :contact_urn_id, :created_on, :modified_on, :next_attempt, :queued_on, :sent_on)
-RETURNING id
-`
+           :visibility, :external_id, :channel_id, :contact_id, :contact_urn_id, :created_on, :modified_on, :next_attempt, :queued_on, :sent_on, :log_uuids)
+RETURNING id`
 
-func writeMsgToDB(ctx context.Context, b *backend, m *DBMsg) error {
+func writeMsgToDB(ctx context.Context, b *backend, m *DBMsg, clog *courier.ChannelLog) error {
 	// grab the contact for this msg
-	contact, err := contactForURN(ctx, b, m.OrgID_, m.channel, m.URN_, m.URNAuth_, m.ContactName_)
+	contact, err := contactForURN(ctx, b, m.OrgID_, m.channel, m.URN_, m.URNAuth_, m.ContactName_, clog)
 
 	// our db is down, write to the spool, we will write/queue this later
 	if err != nil {
-		return err
+		return errors.Wrap(err, "error getting contact for message")
 	}
 
-	// set our contact and urn ids from our contact
+	// set our contact and urn id
 	m.ContactID_ = contact.ID_
 	m.ContactURNID_ = contact.URNID_
 
-	rows, err := b.db.NamedQueryContext(ctx, insertMsgSQL, m)
+	rows, err := b.db.NamedQueryContext(ctx, sqlInsertMsg, m)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "error inserting message")
 	}
 	defer rows.Close()
 
 	rows.Next()
 	err = rows.Scan(&m.ID_)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "error scanning for inserted message id")
 	}
 
 	// queue this up to be handled by RapidPro
@@ -168,7 +177,7 @@ func writeMsgToDB(ctx context.Context, b *backend, m *DBMsg) error {
 	return nil
 }
 
-const selectMsgSQL = `
+const sqlSelectMsg = `
 SELECT
 	org_id,
 	direction,
@@ -176,6 +185,7 @@ SELECT
 	attachments,
 	msg_count,
 	error_count,
+	failed_reason,
 	high_priority,
 	status,
 	visibility,
@@ -187,12 +197,12 @@ SELECT
 	modified_on,
 	next_attempt,
 	queued_on,
-	sent_on
+	sent_on,
+	log_uuids
 FROM
 	msgs_msg
 WHERE
-	id = $1
-`
+	id = $1`
 
 const selectChannelSQL = `
 SELECT
@@ -212,115 +222,6 @@ FROM
 WHERE
     ch.id = $1
 `
-
-// for testing only, returned DBMsg object is not fully populated
-func readMsgFromDB(b *backend, id courier.MsgID) (*DBMsg, error) {
-	m := &DBMsg{
-		ID_: id,
-	}
-	err := b.db.Get(m, selectMsgSQL, id)
-	ch := &DBChannel{
-		ID_: m.ChannelID_,
-	}
-	err = b.db.Get(ch, selectChannelSQL, m.ChannelID_)
-	m.channel = ch
-	return m, err
-}
-
-//-----------------------------------------------------------------------------
-// Media download and classification
-//-----------------------------------------------------------------------------
-
-func downloadMediaToS3(ctx context.Context, b *backend, channel courier.Channel, orgID OrgID, msgUUID courier.MsgUUID, mediaURL string) (string, error) {
-
-	parsedURL, err := url.Parse(mediaURL)
-	if err != nil {
-		return "", err
-	}
-
-	var req *http.Request
-	handler := courier.GetHandler(channel.ChannelType())
-	if handler != nil {
-		builder, isBuilder := handler.(courier.MediaDownloadRequestBuilder)
-		if isBuilder {
-			req, err = builder.BuildDownloadMediaRequest(ctx, b, channel, parsedURL.String())
-
-			// in the case of errors, we log the error but move onwards anyways
-			if err != nil {
-				logrus.WithField("channel_uuid", channel.UUID()).WithField("channel_type", channel.ChannelType()).WithField("media_url", mediaURL).WithError(err).Error("unable to build media download request")
-			}
-		}
-	}
-
-	if req == nil {
-		// first fetch our media
-		req, err = http.NewRequest(http.MethodGet, mediaURL, nil)
-		if err != nil {
-			return "", err
-		}
-	}
-
-	resp, err := utils.GetHTTPClient().Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	mimeType := ""
-	extension := filepath.Ext(parsedURL.Path)
-	if extension != "" {
-		extension = extension[1:]
-	}
-
-	// first try getting our mime type from the first 300 bytes of our body
-	fileType, err := filetype.Match(body[:300])
-	if fileType != filetype.Unknown {
-		mimeType = fileType.MIME.Value
-		extension = fileType.Extension
-	} else {
-		// if that didn't work, try from our extension
-		fileType = filetype.GetType(extension)
-		if fileType != filetype.Unknown {
-			mimeType = fileType.MIME.Value
-			extension = fileType.Extension
-		}
-	}
-
-	// we still don't know our mime type, use our content header instead
-	if mimeType == "" {
-		mimeType, _, _ = mime.ParseMediaType(resp.Header.Get("Content-Type"))
-		if extension == "" {
-			extensions, err := mime.ExtensionsByType(mimeType)
-			if extensions == nil || err != nil {
-				extension = ""
-			} else {
-				extension = extensions[0][1:]
-			}
-		}
-	}
-
-	// create our filename
-	filename := msgUUID.String()
-	if extension != "" {
-		filename = fmt.Sprintf("%s.%s", msgUUID, extension)
-	}
-	path := filepath.Join(b.config.S3MediaPrefix, strconv.FormatInt(int64(orgID), 10), filename[:4], filename[4:8], filename)
-	if !strings.HasPrefix(path, "/") {
-		path = fmt.Sprintf("/%s", path)
-	}
-
-	s3URL, err := b.storage.Put(path, mimeType, body)
-	if err != nil {
-		return "", err
-	}
-
-	// return our new media URL, which is prefixed by our content type
-	return fmt.Sprintf("%s:%s", mimeType, s3URL), nil
-}
 
 //-----------------------------------------------------------------------------
 // Msg flusher for flushing failed writes
@@ -345,8 +246,11 @@ func (b *backend) flushMsgFile(filename string, contents []byte) error {
 	}
 	msg.channel = channel.(*DBChannel)
 
+	// create log tho it won't be written
+	clog := courier.NewChannelLog(courier.ChannelLogTypeMsgReceive, channel, nil)
+
 	// try to write it our db
-	err = writeMsgToDB(ctx, b, msg)
+	err = writeMsgToDB(ctx, b, msg, clog)
 
 	// fail? oh well, we'll try again later
 	return err
@@ -504,7 +408,6 @@ type DBMsg struct {
 	Text_                 string                 `json:"text"            db:"text"`
 	Attachments_          pq.StringArray         `json:"attachments"     db:"attachments"`
 	ExternalID_           null.String            `json:"external_id"     db:"external_id"`
-	ResponseToID_         courier.MsgID          `json:"response_to_id"  db:"response_to_id"`
 	ResponseToExternalID_ string                 `json:"response_to_external_id"`
 	IsResend_             bool                   `json:"is_resend,omitempty"`
 	Metadata_             json.RawMessage        `json:"metadata"        db:"metadata"`
@@ -513,23 +416,27 @@ type DBMsg struct {
 	ContactID_    ContactID         `json:"contact_id"      db:"contact_id"`
 	ContactURNID_ ContactURNID      `json:"contact_urn_id"  db:"contact_urn_id"`
 
-	MessageCount_ int `json:"msg_count"    db:"msg_count"`
-	ErrorCount_   int `json:"error_count"  db:"error_count"`
+	MessageCount_ int         `json:"msg_count"     db:"msg_count"`
+	ErrorCount_   int         `json:"error_count"   db:"error_count"`
+	FailedReason_ null.String `json:"failed_reason" db:"failed_reason"`
 
 	ChannelUUID_ courier.ChannelUUID `json:"channel_uuid"`
 	ContactName_ string              `json:"contact_name"`
 
-	NextAttempt_ time.Time `json:"next_attempt"  db:"next_attempt"`
-	CreatedOn_   time.Time `json:"created_on"    db:"created_on"`
-	ModifiedOn_  time.Time `json:"modified_on"   db:"modified_on"`
-	QueuedOn_    time.Time `json:"queued_on"     db:"queued_on"`
-	SentOn_      time.Time `json:"sent_on"       db:"sent_on"`
+	NextAttempt_ time.Time      `json:"next_attempt"  db:"next_attempt"`
+	CreatedOn_   time.Time      `json:"created_on"    db:"created_on"`
+	ModifiedOn_  time.Time      `json:"modified_on"   db:"modified_on"`
+	QueuedOn_    time.Time      `json:"queued_on"     db:"queued_on"`
+	SentOn_      *time.Time     `json:"sent_on"       db:"sent_on"`
+	LogUUIDs     pq.StringArray `json:"log_uuids"     db:"log_uuids"`
 
 	// fields used to allow courier to update a session's timeout when a message is sent for efficient timeout behavior
 	SessionID_            SessionID  `json:"session_id,omitempty"`
 	SessionTimeout_       int        `json:"session_timeout,omitempty"`
 	SessionWaitStartedOn_ *time.Time `json:"session_wait_started_on,omitempty"`
 	SessionStatus_        string     `json:"session_status,omitempty"`
+
+	Flow_ *courier.FlowReference `json:"flow,omitempty"`
 
 	channel        *DBChannel
 	workerToken    queue.WorkerToken
@@ -547,14 +454,29 @@ func (m *DBMsg) URN() urns.URN                { return m.URN_ }
 func (m *DBMsg) URNAuth() string              { return m.URNAuth_ }
 func (m *DBMsg) ContactName() string          { return m.ContactName_ }
 func (m *DBMsg) HighPriority() bool           { return m.HighPriority_ }
-func (m *DBMsg) ReceivedOn() *time.Time       { return &m.SentOn_ }
-func (m *DBMsg) SentOn() *time.Time           { return &m.SentOn_ }
-func (m *DBMsg) ResponseToID() courier.MsgID  { return m.ResponseToID_ }
+func (m *DBMsg) ReceivedOn() *time.Time       { return m.SentOn_ }
+func (m *DBMsg) SentOn() *time.Time           { return m.SentOn_ }
 func (m *DBMsg) ResponseToExternalID() string { return m.ResponseToExternalID_ }
 func (m *DBMsg) IsResend() bool               { return m.IsResend_ }
 
 func (m *DBMsg) Channel() courier.Channel { return m.channel }
 func (m *DBMsg) SessionStatus() string    { return m.SessionStatus_ }
+
+func (m *DBMsg) Flow() *courier.FlowReference { return m.Flow_ }
+
+func (m *DBMsg) FlowName() string {
+	if m.Flow_ == nil {
+		return ""
+	}
+	return m.Flow_.Name
+}
+
+func (m *DBMsg) FlowUUID() string {
+	if m.Flow_ == nil {
+		return ""
+	}
+	return m.Flow_.UUID
+}
 
 func (m *DBMsg) QuickReplies() []string {
 	if m.quickReplies != nil {
@@ -597,7 +519,7 @@ func (m *DBMsg) urnFingerprint() string {
 func (m *DBMsg) WithContactName(name string) courier.Msg { m.ContactName_ = name; return m }
 
 // WithReceivedOn can be used to set sent_on on a msg in a chained call
-func (m *DBMsg) WithReceivedOn(date time.Time) courier.Msg { m.SentOn_ = date; return m }
+func (m *DBMsg) WithReceivedOn(date time.Time) courier.Msg { m.SentOn_ = &date; return m }
 
 // WithExternalID can be used to set the external id on a msg in a chained call
 func (m *DBMsg) WithExternalID(id string) courier.Msg { m.ExternalID_ = null.String(id); return m }
@@ -610,6 +532,9 @@ func (m *DBMsg) WithUUID(uuid courier.MsgUUID) courier.Msg { m.UUID_ = uuid; ret
 
 // WithMetadata can be used to add metadata to a Msg
 func (m *DBMsg) WithMetadata(metadata json.RawMessage) courier.Msg { m.Metadata_ = metadata; return m }
+
+// WithFlow can be used to add flow to a Msg
+func (m *DBMsg) WithFlow(flow *courier.FlowReference) courier.Msg { m.Flow_ = flow; return m }
 
 // WithAttachment can be used to append to the media urls for a message
 func (m *DBMsg) WithAttachment(url string) courier.Msg {

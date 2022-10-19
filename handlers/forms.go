@@ -6,26 +6,19 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 
 	"github.com/gorilla/schema"
-	validator "gopkg.in/go-playground/validator.v9"
+	"github.com/nyaruka/courier/utils"
 )
 
 var (
-	decoder  = schema.NewDecoder()
-	validate = validator.New()
+	decoder = schema.NewDecoder()
 )
 
 func init() {
 	decoder.IgnoreUnknownKeys(true)
 	decoder.SetAliasTag("name")
-}
-
-// Validate validates the passe din struct using our shared validator instance
-func Validate(form interface{}) error {
-	return validate.Struct(form)
 }
 
 // DecodeAndValidateForm takes the passed in form and attempts to parse and validate it from the
@@ -42,7 +35,7 @@ func DecodeAndValidateForm(form interface{}, r *http.Request) error {
 	}
 
 	// check our input is valid
-	err = validate.Struct(form)
+	err = utils.Validate(form)
 	if err != nil {
 		return err
 	}
@@ -64,7 +57,7 @@ func DecodeAndValidateJSON(envelope interface{}, r *http.Request) error {
 	}
 
 	// check our input is valid
-	err = validate.Struct(envelope)
+	err = utils.Validate(envelope)
 	if err != nil {
 		return fmt.Errorf("request JSON doesn't match required schema: %s", err)
 	}
@@ -86,7 +79,7 @@ func DecodeAndValidateXML(envelope interface{}, r *http.Request) error {
 	}
 
 	// check our input is valid
-	err = validate.Struct(envelope)
+	err = utils.Validate(envelope)
 	if err != nil {
 		return fmt.Errorf("request XML doesn't match required schema: %s", err)
 	}
@@ -96,8 +89,8 @@ func DecodeAndValidateXML(envelope interface{}, r *http.Request) error {
 
 // ReadBody of a HTTP request up to limit bytes and make sure the Body is not consumed
 func ReadBody(r *http.Request, limit int64) ([]byte, error) {
-	body, err := ioutil.ReadAll(io.LimitReader(r.Body, limit))
-	r.Body = ioutil.NopCloser(bytes.NewBuffer(body))
+	body, err := io.ReadAll(io.LimitReader(r.Body, limit))
+	r.Body = io.NopCloser(bytes.NewBuffer(body))
 	return body, err
 
 }

@@ -28,8 +28,8 @@ INSERT INTO channels_channel("id", "schemes", "is_active", "created_on", "modifi
 
 /* Contacts with ids 100, 101 */
 DELETE FROM contacts_contact;
-INSERT INTO contacts_contact("id", "is_active", "status", "created_on", "modified_on", "uuid", "language", "created_by_id", "modified_by_id", "org_id")
-                      VALUES(100, True, 'A', now(), now(), 'a984069d-0008-4d8c-a772-b14a8a6acccc', 'eng', 1, 1, 1);
+INSERT INTO contacts_contact("id", "is_active", "status", "created_on", "modified_on", "uuid", "language", "ticket_count", "created_by_id", "modified_by_id", "org_id")
+                      VALUES(100, True, 'A', now(), now(), 'a984069d-0008-4d8c-a772-b14a8a6acccc', 'eng', 0, 1, 1, 1);
 
 /** ContactURN with id 1000 */
 DELETE FROM contacts_contacturn;
@@ -52,6 +52,13 @@ INSERT INTO msgs_msg("id", "text", "high_priority", "created_on", "modified_on",
                         "msg_count", "error_count", "next_attempt", "external_id", "channel_id", "contact_id", "contact_urn_id", "org_id")
               VALUES(10002, 'test message incoming', True, now(), now(), now(), now(), 'I', 'P', 'V',
                      1, 0, now(), 'ext2', 10, 100, 1000, 1);
+
+INSERT INTO msgs_media("id", "uuid", "org_id", "content_type", "url", "path", "size", "duration", "width", "height", "original_id")
+                VALUES(100, 'ec6972be-809c-4c8d-be59-ba9dbd74c977', 1, 'image/jpeg', 'http://nyaruka.s3.com/orgs/1/media/ec69/ec6972be-809c-4c8d-be59-ba9dbd74c977/test.jpg', '/orgs/1/media/ec69/ec6972be-809c-4c8d-be59-ba9dbd74c977/test.jpg', 123, 0, 1024, 768, NULL);
+INSERT INTO msgs_media("id", "uuid", "org_id", "content_type", "url", "path", "size", "duration", "width", "height", "original_id")
+                VALUES(101, '5310f50f-9c8e-4035-9150-be5a1f78f21a', 1, 'audio/mp3', 'http://nyaruka.s3.com/orgs/1/media/5310/5310f50f-9c8e-4035-9150-be5a1f78f21a/test.mp3', '/orgs/1/media/5310/5310f50f-9c8e-4035-9150-be5a1f78f21a/test.mp3', 123, 500, 0, 0, NULL);
+INSERT INTO msgs_media("id", "uuid", "org_id", "content_type", "url", "path", "size", "duration", "width", "height", "original_id")
+                VALUES(102, '514c552c-e585-40e2-938a-fe9450172da8', 1, 'audio/mp4', 'http://nyaruka.s3.com/orgs/1/media/514c/514c552c-e585-40e2-938a-fe9450172da8/test.m4a', '/orgs/1/media/514c/514c552c-e585-40e2-938a-fe9450172da8/test.m4a', 114, 500, 0, 0, 101);
 
 /** Simple session */
 DELETE from flows_flowsession;

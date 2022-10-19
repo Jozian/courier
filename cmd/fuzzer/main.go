@@ -27,7 +27,7 @@ func main() {
 		MaxIdle:     2,                 // only keep up to 2 idle
 		IdleTimeout: 240 * time.Second, // how long to wait before reaping a connection
 		Dial: func() (redis.Conn, error) {
-			conn, err := redis.Dial("tcp", fmt.Sprintf("%s", redisURL.Host))
+			conn, err := redis.Dial("tcp", redisURL.Host)
 			if err != nil {
 				return nil, err
 			}
@@ -53,11 +53,11 @@ func main() {
 	// insert our messages
 	for i := 0; i < 1000; i++ {
 		json := fmt.Sprintf(msgJSON, i)
-		_, err := conn.Do("zadd", "msgs:"+channelUUID, 0.0, json)
+		_, err := conn.Do("ZADD", "msgs:"+channelUUID, 0.0, json)
 		if err != nil {
 			log.Fatalf("err inserting msg: %s", err)
 		}
-		_, err = conn.Do("zincrby", "msgs:active", 0.0, channelUUID)
+		_, err = conn.Do("ZINCRBY", "msgs:active", 0.0, channelUUID)
 		if err != nil {
 			log.Fatalf("err incrementing active: %s", err)
 		}

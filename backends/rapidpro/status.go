@@ -11,14 +11,13 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/nyaruka/gocommon/urns"
-
 	"github.com/jmoiron/sqlx"
 	"github.com/nyaruka/courier"
+	"github.com/nyaruka/gocommon/urns"
 )
 
 // newMsgStatus creates a new DBMsgStatus for the passed in parameters
-func newMsgStatus(channel courier.Channel, id courier.MsgID, externalID string, status courier.MsgStatusValue) *DBMsgStatus {
+func newMsgStatus(channel courier.Channel, id courier.MsgID, externalID string, status courier.MsgStatusValue, clog *courier.ChannelLog) *DBMsgStatus {
 	dbChannel := channel.(*DBChannel)
 
 	return &DBMsgStatus{
@@ -30,6 +29,7 @@ func newMsgStatus(channel courier.Channel, id courier.MsgID, externalID string, 
 		ExternalID_:  externalID,
 		Status_:      status,
 		ModifiedOn_:  time.Now().In(time.UTC),
+		LogUUID:      clog.UUID(),
 	}
 }
 
@@ -75,7 +75,7 @@ func checkMsgExists(b *backend, status courier.MsgStatus) (err error) {
 }
 
 // the craziness below lets us update our status to 'F' and schedule retries without knowing anything about the message
-const updateMsgID = `
+const sqlUpdateMsgByID = `
 UPDATE msgs_msg SET 
 	status = CASE 
 		WHEN 
@@ -107,13 +107,21 @@ UPDATE msgs_msg SET
 		ELSE 
 			next_attempt 
 		END,
+	failed_reason = CASE
+		WHEN
+			error_count >= 2
+		THEN
+			'E'
+		ELSE
+			failed_reason
+	    END,
 	sent_on = CASE 
-		WHEN 
-			:status = 'W' 
-		THEN 
-			NOW() 
-		ELSE 
-			sent_on 
+		WHEN
+			:status IN ('W', 'S', 'D')
+		THEN
+			COALESCE(sent_on, NOW())
+		ELSE
+			NULL
 		END,
 	external_id = CASE
 		WHEN 
@@ -123,7 +131,8 @@ UPDATE msgs_msg SET
 		ELSE
 			external_id
 		END,
-	modified_on = :modified_on
+	modified_on = :modified_on,
+	log_uuids = array_append(log_uuids, :log_uuid)
 WHERE 
 	msgs_msg.id = :msg_id AND
 	msgs_msg.channel_id = :channel_id AND 
@@ -132,7 +141,7 @@ RETURNING
 	msgs_msg.id
 `
 
-const updateMsgExternalID = `
+const sqlUpdateMsgByExternalID = `
 UPDATE msgs_msg SET 
 	status = CASE 
 		WHEN 
@@ -164,15 +173,24 @@ UPDATE msgs_msg SET
 		ELSE 
 			next_attempt 
 		END,
+	failed_reason = CASE
+		WHEN
+			error_count >= 2
+		THEN
+			'E'
+		ELSE
+			failed_reason
+	    END,
 	sent_on = CASE 
-		WHEN 
-			:status = 'W' 
-		THEN 
-			NOW() 
-		ELSE 
-			sent_on 
+		WHEN
+			:status IN ('W', 'S', 'D')
+		THEN
+			COALESCE(sent_on, NOW())
+		ELSE
+			NULL
 		END,
-	modified_on = :modified_on
+	modified_on = :modified_on,
+	log_uuids = array_append(log_uuids, :log_uuid)
 WHERE 
 	msgs_msg.id = (SELECT msgs_msg.id FROM msgs_msg WHERE msgs_msg.external_id = :external_id AND msgs_msg.channel_id = :channel_id AND msgs_msg.direction = 'O' LIMIT 1)
 RETURNING 
@@ -185,9 +203,9 @@ func writeMsgStatusToDB(ctx context.Context, b *backend, status *DBMsgStatus) er
 	var err error
 
 	if status.ID() != courier.NilMsgID {
-		rows, err = b.db.NamedQueryContext(ctx, updateMsgID, status)
+		rows, err = b.db.NamedQueryContext(ctx, sqlUpdateMsgByID, status)
 	} else if status.ExternalID() != "" {
-		rows, err = b.db.NamedQueryContext(ctx, updateMsgExternalID, status)
+		rows, err = b.db.NamedQueryContext(ctx, sqlUpdateMsgByExternalID, status)
 	} else {
 		return fmt.Errorf("attempt to update msg status without id or external id")
 	}
@@ -264,12 +282,12 @@ UPDATE msgs_msg SET
 			next_attempt 
 		END,
 	sent_on = CASE 
-		WHEN 
-			s.status = 'W' 
-		THEN 
-			NOW() 
-		ELSE 
-			sent_on 
+		WHEN
+			s.status IN ('W', 'S', 'D')
+		THEN
+			COALESCE(sent_on, NOW())
+		ELSE
+			NULL
 		END,
 	external_id = CASE
 		WHEN 
@@ -279,17 +297,16 @@ UPDATE msgs_msg SET
 		ELSE
 			msgs_msg.external_id
 		END,
-	modified_on = NOW()
+	modified_on = NOW(),
+	log_uuids = array_append(log_uuids, s.log_uuid::uuid)
 FROM
-	(VALUES(:msg_id, :channel_id, :status, :external_id)) 
+	(VALUES(:msg_id, :channel_id, :status, :external_id, :log_uuid)) 
 AS 
-	s(msg_id, channel_id, status, external_id) 
+	s(msg_id, channel_id, status, external_id, log_uuid) 
 WHERE 
 	msgs_msg.id = s.msg_id::bigint AND
 	msgs_msg.channel_id = s.channel_id::int AND 
 	msgs_msg.direction = 'O'
-RETURNING 
-	msgs_msg.id
 `
 
 //-----------------------------------------------------------------------------
@@ -306,8 +323,7 @@ type DBMsgStatus struct {
 	ExternalID_  string                 `json:"external_id,omitempty"    db:"external_id"`
 	Status_      courier.MsgStatusValue `json:"status"                   db:"status"`
 	ModifiedOn_  time.Time              `json:"modified_on"              db:"modified_on"`
-
-	logs []*courier.ChannelLog
+	LogUUID      courier.ChannelLogUUID `json:"log_uuid"                 db:"log_uuid"`
 }
 
 func (s *DBMsgStatus) EventID() int64 { return int64(s.ID_) }
@@ -353,9 +369,6 @@ func (s *DBMsgStatus) HasUpdatedURN() bool {
 
 func (s *DBMsgStatus) ExternalID() string      { return s.ExternalID_ }
 func (s *DBMsgStatus) SetExternalID(id string) { s.ExternalID_ = id }
-
-func (s *DBMsgStatus) Logs() []*courier.ChannelLog    { return s.logs }
-func (s *DBMsgStatus) AddLog(log *courier.ChannelLog) { s.logs = append(s.logs, log) }
 
 func (s *DBMsgStatus) Status() courier.MsgStatusValue          { return s.Status_ }
 func (s *DBMsgStatus) SetStatus(status courier.MsgStatusValue) { s.Status_ = status }
